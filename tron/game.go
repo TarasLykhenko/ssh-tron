@@ -3,27 +3,58 @@ package tron
 import (
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
-	"os/signal"
 	"time"
+
+	"github.com/faiface/pixel"
+	"github.com/faiface/pixel/pixelgl"
+	"github.com/faiface/pixel/text"
+	"github.com/golang/freetype/truetype"
+	"github.com/lucasb-eyer/go-colorful"
+	"golang.org/x/image/colornames"
+	"golang.org/x/image/font"
 )
 
 type ID uint16
 
 type Game struct {
 	Config
-	w, h, bw, bh     int         // total score+board size
-	db               *Database   // database
-	server           *Server     // ssh server
-	score            *scoreboard // state
-	bot              *Bot        // chat bot
-	board            Board
-	idPool           chan ID
-	allPlayers       map[string]*Player
-	allPlayersSorted []*Player
-	currPlayers      map[ID]*Player
-	logf             func(format string, args ...interface{})
+	w, h, bw, bh int         // total score+board size
+	db           *Database   // database
+	score        *scoreboard // state
+	board        Board
+	allPlayers   map[string]*Player
+	currPlayers  map[ID]*Player
+	playerColors []colorful.Color
+	gameWindow   *pixelgl.Window
+	txtRefresher *text.Text
+
+	logf func(format string, args ...interface{})
+}
+
+func loadTTF(path string, size float64) (font.Face, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	bytes, err := ioutil.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+
+	font, err := truetype.Parse(bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return truetype.NewFace(font, &truetype.Options{
+		Size:              size,
+		GlyphCacheEntries: 1,
+	}), nil
 }
 
 // NewGame returns an initialized Game according to the input arguments.
@@ -43,29 +74,20 @@ func NewGame(c Config) (*Game, error) {
 	if err != nil {
 		return nil, err
 	}
-	// create an id pool
-	idPool := make(chan ID, c.MaxPlayers)
-	for id := 1; id <= c.MaxPlayers; id++ {
-		idPool <- ID(id)
-	}
-	server, err := NewServer(db, c.Port, idPool)
-	if err != nil {
-		return nil, err
-	}
+
 	g := &Game{
-		Config:      c,
-		w:           c.Width + sidebarWidth,
-		h:           c.Height / 2,
-		bw:          c.Height,
-		bh:          c.Width,
-		db:          db,
-		server:      server,
-		bot:         &Bot{},
-		board:       board,
-		idPool:      idPool,
-		allPlayers:  make(map[string]*Player),
-		currPlayers: make(map[ID]*Player),
-		logf:        log.New(os.Stdout, "tron: ", 0).Printf,
+		Config:       c,
+		w:            c.Width + sidebarWidth,
+		h:            c.Height / 2,
+		bw:           c.Height,
+		bh:           c.Width,
+		db:           db,
+		board:        board,
+		playerColors: colorful.FastHappyPalette(10),
+		allPlayers:   make(map[string]*Player),
+		currPlayers:  make(map[ID]*Player),
+		gameWindow:   c.GameWindow,
+		logf:         log.New(os.Stdout, "tron: ", 0).Printf,
 	}
 	g.score = &scoreboard{g: g}
 	//load initial player list
@@ -76,27 +98,17 @@ func NewGame(c Config) (*Game, error) {
 	for _, p := range prevPlayers {
 		g.allPlayers[p.hash] = p
 	}
-	// initialise slack if provided
-	if t := c.SlackToken; t != "" {
-		ch := c.SlackChannel
-		if ch == "" {
-			return nil, errors.New("Slack channel must also be specified (--slack-channel)")
-		}
-		if err := g.bot.init(t, ch); err != nil {
-			return nil, err
-		}
-		motd := "tron server started\n"
-		if g.Config.JoinAddress != "" {
-			motd += fmt.Sprintf("join using: `ssh %s`", g.Config.JoinAddress)
-		} else {
-			motd += fmt.Sprintf("join using:\n```\n%s\n```\n", g.server.addresses)
-		}
-		if err := g.bot.message(motd); err != nil {
-			return nil, err
-		}
-		go g.bot.start()
-	}
-	//compute initial score, load into slackbot
+
+	fontFace, _ := loadTTF("./font/MesloLGSNFRegular.ttf", 20)
+
+	atlas := text.NewAtlas(fontFace, text.ASCII, []rune{filled, top, bottom, empty})
+
+	txt := text.New(pixel.V(float64(g.w), 670), atlas)
+
+	txt.Color = colornames.Lightgrey
+
+	g.txtRefresher = txt
+	//compute initial score
 	g.score.compute()
 	//game ready
 	return g, nil
@@ -114,66 +126,7 @@ func (g *Game) Play() {
 	}
 
 	// start the game ticker!
-	go g.tick()
-
-	// ready for players!
-	g.logf("game started (#%d player slots, %s/tick)", len(g.idPool), g.Config.GameSpeed)
-
-	// watch signals (catch Ctrl+C and gracefully shutdown)
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, os.Kill)
-	go g.watch(c)
-	addr := g.Config.JoinAddress
-	if addr == "" {
-		addr = "\n" + g.server.addresses
-	}
-	// start the ssh server
-	go g.server.start()
-	g.logf("server up (fingerprint %s)\njoin at: %s\n", fingerprintKey(g.server.privateKey.PublicKey()), addr)
-	// handle incoming players forever (channel never closed)
-	for p := range g.server.newPlayers {
-		go g.handle(p)
-	}
-}
-
-func (g *Game) watch(c chan os.Signal) {
-	<-c
-	g.logf("game ending...")
-	for _, p := range g.currPlayers {
-		p.teardown()
-	}
-	g.db.Close()
-	time.Sleep(300 * time.Millisecond)
-	os.Exit(0)
-}
-
-func (g *Game) handle(p *Player) {
-	// check not already connected
-	if existing, ok := g.allPlayers[p.hash]; ok && existing.id != blank {
-		p.teardown()
-		p.logf("rejected - already connected as %s", existing.cname)
-		g.idPool <- p.id //put back
-		return
-	}
-	// attempt to load previous scores
-	if err := g.db.load(p); err != nil {
-		//otherwise new player
-		g.db.save(p)
-	}
-	// connected with a valid id
-	p.g = g
-	g.allPlayers[p.hash] = p
-	g.currPlayers[p.id] = p
-	g.score.compute()
-	// connected
-	p.play() //block while playing
-	// disconnected
-	g.remove(p)
-	delete(g.currPlayers, p.id)
-	// reinsert back into pool
-	g.idPool <- p.id
-	p.id = blank
-	p.teardown()
+	g.tick()
 }
 
 func (g *Game) death(p *Player) {
@@ -210,18 +163,46 @@ func (g *Game) remove(p *Player) {
 	p.waiting = false
 }
 
+func (g *Game) AddPlayer(p *Player) {
+	// attempt to load previous scores
+	if err := g.db.load(p); err != nil {
+		//otherwise new player
+		g.db.save(p)
+	}
+	// connected with a valid id
+	p.g = g
+	p.respawn()
+	g.allPlayers[p.hash] = p
+	g.currPlayers[p.id] = p
+	g.score.compute()
+	// connected
+}
+
 func (g *Game) tick() {
+	fps := time.Tick(time.Second / 16)
+
 	// loop forever
-	for {
-		t0 := time.Now()
+	for !g.gameWindow.Closed() {
+		g.gameWindow.Clear(colornames.Black)
+		g.txtRefresher.Clear()
+
 		// move each player 1 square
 		for _, p := range g.currPlayers {
 			// skip this player
 			if p.dead {
 				continue
 			}
+
+			if g.gameWindow.Pressed(pixelgl.KeyLeft) {
+				p.d = dleft
+			} else if g.gameWindow.Pressed(pixelgl.KeyRight) {
+				p.d = dright
+			} else if g.gameWindow.Pressed(pixelgl.KeyDown) {
+				p.d = ddown
+			} else if g.gameWindow.Pressed(pixelgl.KeyUp) {
+				p.d = dup
+			}
 			// move player in [d]irection
-			p.d = p.nextd
 			switch p.d {
 			case dup:
 				p.y--
@@ -240,7 +221,7 @@ func (g *Game) tick() {
 					other.Kills++
 					g.score.compute()
 					go g.db.save(other) //save new kill count
-					other.logf("killed %s", p.cname)
+					other.logf("killed %s", p.Name)
 				}
 				// this player dies...
 				p.dead = true
@@ -250,20 +231,100 @@ func (g *Game) tick() {
 			// place a player square
 			g.board[p.x][p.y] = p.id
 		}
-		// update bot score list
-		if g.score.changed && g.bot.connected {
-			g.bot.scoreChange(g.score.allPlayersSorted)
-		}
-		// send delta updates to each player
-		for _, p := range g.currPlayers {
-			if p.ready {
-				p.update()
-			}
-		}
+		g.refreshScreen()
 		// mark score as used
 		g.score.changed = false
 		// game sleep! (attempt to stablize game speed)
-		cpu := time.Now().Sub(t0)
-		time.Sleep(g.GameSpeed - cpu*2)
+		<-fps
 	}
+}
+
+func (g *Game) refreshScreen() {
+
+	gb := g.board
+
+	// score state
+	totalPlayers := len(g.score.allPlayersSorted)
+	startIndex := 0
+
+	// store the last rendered for optimisation
+	var r rune
+	var c ID
+	// screen loop
+	for h := 0; h < g.h; h++ {
+		for tw := 0; tw < g.w; tw++ {
+			// each iteration draws rune (r) and color (c)
+			// at terminal location: w x h
+			r = empty
+			c = blank
+			// choose a rune to draw, either from
+			// sidebar or from game board
+			if tw < sidebarWidth {
+				// pick rune from sidebar
+				if tw == 0 {
+					r = filled
+				} else if h == 0 {
+					r = top
+				} else if h == g.h-1 {
+					r = bottom
+				} else {
+					bh := h - 1 //borderless height
+					playerSlot := bh / slotHeight
+					playerIndex := startIndex + playerSlot
+					if playerIndex < totalPlayers {
+						sp := g.score.allPlayersSorted[playerIndex]
+						line := bh % slotHeight
+						if tw == 1 {
+							switch line {
+							case 0:
+								sp.score[0] = fmt.Sprintf("%s            ", sp.Name)
+							case 1:
+								sp.score[1] = fmt.Sprintf("  rank  #%03d  ", sp.rank)
+							case 2:
+								sp.score[2] = fmt.Sprintf("  %s           ", sp.status())
+							case 3:
+								sp.score[3] = fmt.Sprintf("  kills %4d   ", sp.Kills)
+							}
+						}
+						if tw-1 < len(sp.score[line]) {
+							r = rune(sp.score[line][tw-1])
+							c = sp.id
+						}
+					}
+				}
+			} else {
+				// pick rune from game board, one rune is two game tiles
+				gw := tw - sidebarWidth
+				h1 := h * 2
+				h2 := h1 + 1
+				// choose rune
+				if gb[gw][h1] != blank && gb[gw][h2] != blank {
+					r = filled
+				} else if gb[gw][h1] != blank {
+					r = top
+				} else if gb[gw][h2] != blank {
+					r = bottom
+				}
+				// choose color (use color of h1, otherwise h2)
+				if gb[gw][h2] == blank {
+					c = gb[gw][h1]
+				} else {
+					c = gb[gw][h2]
+				}
+
+			}
+			if c != wall {
+				g.txtRefresher.Color = g.playerColors[c]
+			} else {
+				g.txtRefresher.Color = g.playerColors[9]
+			}
+			g.txtRefresher.WriteRune(r)
+		}
+		g.txtRefresher.WriteRune('\n')
+
+	}
+
+	g.txtRefresher.Draw(g.gameWindow, pixel.IM)
+	g.gameWindow.Update()
+
 }

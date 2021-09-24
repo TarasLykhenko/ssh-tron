@@ -7,16 +7,30 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/jpillora/opts"
-	"github.com/jpillora/ssh-tron/tron"
+	"github.com/TarasLykhenko/tron/tron"
+	"github.com/faiface/pixel"
+	"github.com/faiface/pixel/pixelgl"
+	"golang.org/x/image/colornames"
 )
 
 var VERSION = "0.0.0-src"
 
-func main() {
+func run() {
+	cfg := pixelgl.WindowConfig{
+		Title:  "Pixel Rocks!",
+		Bounds: pixel.R(0, 0, 1024, 768),
+		VSync:  true,
+	}
+	win, err := pixelgl.NewWindow(cfg)
+	if err != nil {
+		panic(err)
+	}
+
+	win.Clear(colornames.Skyblue)
+
+	p := tron.NewPlayer(1, "Taras")
 
 	c := tron.Config{
-		Port:       2200,
 		Width:      60,
 		Height:     60,
 		MaxPlayers: 6,
@@ -25,18 +39,24 @@ func main() {
 		GameSpeed:    40 * time.Millisecond,
 		RespawnDelay: 2 * time.Second,
 		DBLocation:   filepath.Join(os.TempDir(), "tron.db"),
+		GameWindow:   win,
 	}
-
-	opts.New(&c).
-		PkgRepo().
-		Version(VERSION).
-		Parse()
 
 	rand.Seed(time.Now().UnixNano())
 
 	g, err := tron.NewGame(c)
+	g.AddPlayer(p)
 	if err != nil {
 		log.Fatal(err)
 	}
 	g.Play()
+
+	for !win.Closed() {
+		win.Update()
+	}
+}
+
+func main() {
+
+	pixelgl.Run(run)
 }

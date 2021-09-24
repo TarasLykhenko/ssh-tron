@@ -1,5 +1,4 @@
 FROM alpine
-MAINTAINER dev@jpillora.com
 
 #configure go path
 ENV GOPATH /root/go
@@ -22,4 +21,4 @@ RUN apk update && \
 #then go get -u $PACKAGE to update deps
 
 #run package
-ENTRYPOINT ["ssh-tron"]
+ENTRYPOINT ["tron"]
